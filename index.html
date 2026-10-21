@@ -144,6 +144,7 @@
   nav.tabs button:hover { background: rgba(255, 255, 255, .12); opacity: 1; }
   nav.tabs button.active { background: var(--bg); color: var(--accent-ink); opacity: 1; }
   .tab-panel { display: grid; gap: 16px; }
+  main > *, .tab-panel > *, .stats-grid > * { min-width: 0; }   /* 차트가 화면 밖으로 넘치지 않게 */
   .tab-panel[hidden] { display: none; }
 
   /* 통계 */
@@ -183,11 +184,54 @@
   </div>
 </header>
 
+<nav class="tabs">
+  <div class="inner">
+    <button type="button" class="active" data-tab="booking">예약</button>
+    <button type="button" data-tab="stats">통계</button>
+  </div>
+</nav>
+
 <main>
   <div id="setup" class="setup" hidden>
     index.html 맨 아래 &lt;script&gt;의 SUPABASE_URL, SUPABASE_KEY 값을 내 프로젝트 값으로 바꿔 주세요.
     (Supabase › Project Settings › API Keys 에서 Project URL과 publishable key를 복사)
   </div>
+
+  <!-- ===================== 통계 탭 ===================== -->
+  <div class="tab-panel" id="tab-stats" hidden>
+    <section class="card">
+      <div class="toolbar" style="margin-bottom:0">
+        <div class="seg" role="group" aria-label="기간 선택">
+          <button type="button" class="active" data-range="week">이번 주</button>
+          <button type="button" data-range="month">이번 달</button>
+        </div>
+        <span class="spacer"></span>
+        <button type="button" id="st-refresh">새로고침</button>
+      </div>
+      <p class="stats-summary" id="st-summary" style="margin:12px 0 0"></p>
+    </section>
+
+    <div class="stats-grid">
+      <section class="card full">
+        <h3>특별실별 이용률</h3>
+        <p class="sub">예약 건수 ÷ (기간 내 평일 수 × 6교시) × 100</p>
+        <div class="chart-box"><canvas id="ch-rooms"></canvas></div>
+      </section>
+      <section class="card">
+        <h3>요일·교시별 혼잡도</h3>
+        <p class="sub">원이 클수록 예약이 많은 시간입니다 (전체 특별실 합계)</p>
+        <div class="chart-box"><canvas id="ch-busy"></canvas></div>
+      </section>
+      <section class="card">
+        <h3>학년별 이용 횟수</h3>
+        <p class="sub">기간 내 학년별 예약 건수</p>
+        <div class="chart-box"><canvas id="ch-grade"></canvas></div>
+      </section>
+    </div>
+  </div>
+
+  <!-- ===================== 예약 탭 ===================== -->
+  <div class="tab-panel" id="tab-booking">
 
   <!-- 1. 예약 등록 -->
   <section class="card" id="form-card">
@@ -276,6 +320,7 @@
     <label class="check"><input type="checkbox" id="s-past"> 지난 예약도 보기</label>
     <div class="list" id="list"></div>
   </section>
+  </div><!-- /예약 탭 -->
 </main>
 
 <div id="toast" role="status" aria-live="polite"></div>
@@ -388,7 +433,7 @@ async function submitReservation(ev) {
     toast(`${niceDate(date)} ${row.period}교시 ${roomName(row.room_id)} 예약 완료!`, 'ok');
     $('f-purpose').value = '';
   }
-  await Promise.all([renderWeek(), loadList()]);   // 성공·실패 모두 최신 상태로 새로 고침
+  await Promise.all([renderWeek(), loadList(), renderStats()]);   // 성공·실패 모두 최신 상태로 새로 고침 (차트 포함)
 }
 
 // =====================================================================
@@ -504,7 +549,141 @@ async function onCancelClick(ev) {
   } else {
     toast('예약을 취소했습니다.', 'ok');
   }
-  await Promise.all([renderWeek(), loadList()]);
+  await Promise.all([renderWeek(), loadList(), renderStats()]);
+}
+
+// =====================================================================
+// 5. 통계 (Chart.js)
+// =====================================================================
+const ACCENT = '#2f7d5b';
+const WEEKDAY_LABELS = ['월', '화', '수', '목', '금'];
+let statsRange = 'week';    // 'week' = 이번 주, 'month' = 이번 달
+const charts = {};          // 그려 둔 차트 (다시 그릴 때 이전 차트를 지우기 위해 보관)
+
+// 기간의 시작일·마지막일
+function rangeOf(kind) {
+  const now = new Date();
+  if (kind === 'month') {
+    return { from: new Date(now.getFullYear(), now.getMonth(), 1), to: new Date(now.getFullYear(), now.getMonth() + 1, 0) };
+  }
+  const mon = mondayOf(now);
+  return { from: mon, to: addDays(mon, 4) };
+}
+
+// 기간 안의 평일 수
+function countWeekdays(from, to) {
+  let n = 0;
+  for (let d = new Date(from); d <= to; d = addDays(d, 1)) {
+    const w = d.getDay();
+    if (w !== 0 && w !== 6) n++;
+  }
+  return n;
+}
+
+// 차트를 새로 그리기 (같은 자리에 있던 차트는 먼저 지움)
+function drawChart(id, config) {
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart($(id), config);
+}
+
+async function renderStats() {
+  if (!db || $('tab-stats').hidden) return;   // 통계 탭이 보일 때만 그림
+  const { from, to } = rangeOf(statsRange);
+
+  const { data, error } = await db.from('reservations')
+    .select('room_id, reserved_date, period, grade')
+    .gte('reserved_date', fmt(from))
+    .lte('reserved_date', fmt(to));
+  if (error) { toast(errMsg(error), 'error'); return; }
+
+  const weekdays = countWeekdays(from, to);
+  const slots = weekdays * PERIODS.length;     // 특별실 하나가 기간 동안 예약될 수 있는 칸 수
+  $('st-summary').innerHTML =
+    `기간 <strong>${from.getMonth() + 1}/${from.getDate()} ~ ${to.getMonth() + 1}/${to.getDate()}</strong>` +
+    ` · 평일 <strong>${weekdays}일</strong> · 특별실당 <strong>${slots}칸</strong>` +
+    ` · 예약 <strong>${data.length}건</strong>`;
+
+  // ① 특별실별 이용률 (가로 막대, %)
+  const byRoom = rooms.map((r) => data.filter((x) => x.room_id === r.id).length);
+  const util = byRoom.map((c) => (slots ? Math.round((c / slots) * 1000) / 10 : 0));
+  drawChart('ch-rooms', {
+    type: 'bar',
+    data: {
+      labels: rooms.map((r) => r.name),
+      datasets: [{ label: '이용률', data: util, backgroundColor: ACCENT, borderRadius: 6, barThickness: 22 }],
+    },
+    options: {
+      indexAxis: 'y',
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (c) => `${c.parsed.x}% (${byRoom[c.dataIndex]}건 / ${slots}칸)` } },
+      },
+      scales: { x: { min: 0, max: 100, ticks: { callback: (v) => v + '%' } }, y: { grid: { display: false } } },
+    },
+  });
+
+  // ② 요일·교시별 혼잡도 (bubble: x = 월~금, y = 1~6교시, 원 크기 = 예약 건수)
+  const grid = {};
+  data.forEach((r) => {
+    const w = parse(r.reserved_date).getDay();          // 1(월) ~ 5(금)
+    if (w < 1 || w > 5) return;
+    const key = `${w}_${r.period}`;
+    grid[key] = (grid[key] || 0) + 1;
+  });
+  const maxCount = Math.max(1, ...Object.values(grid));
+  const points = Object.entries(grid).map(([key, count]) => {
+    const [w, p] = key.split('_').map(Number);
+    return { x: w - 1, y: p, r: 5 + (count / maxCount) * 17, count };
+  });
+  drawChart('ch-busy', {
+    type: 'bubble',
+    data: { datasets: [{ label: '예약 건수', data: points, backgroundColor: 'rgba(47, 125, 91, .35)', borderColor: ACCENT }] },
+    options: {
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (c) => `${WEEKDAY_LABELS[c.raw.x]}요일 ${c.raw.y}교시: ${c.raw.count}건` } },
+      },
+      scales: {
+        x: {
+          min: -0.5, max: 4.5,
+          afterBuildTicks: (axis) => { axis.ticks = [0, 1, 2, 3, 4].map((value) => ({ value })); },
+          ticks: { callback: (v) => WEEKDAY_LABELS[v] ?? '' },
+          grid: { display: false },
+        },
+        y: {
+          reverse: true, min: 0.5, max: 6.5,                  // 1교시가 위에 오도록 뒤집음
+          afterBuildTicks: (axis) => { axis.ticks = PERIODS.map((value) => ({ value })); },
+          ticks: { callback: (v) => v + '교시' },
+        },
+      },
+    },
+  });
+
+  // ③ 학년별 이용 횟수 (세로 막대)
+  const grades = [1, 2, 3, 4, 5, 6];
+  const byGrade = grades.map((g) => data.filter((r) => r.grade === g).length);
+  drawChart('ch-grade', {
+    type: 'bar',
+    data: {
+      labels: grades.map((g) => g + '학년'),
+      datasets: [{ label: '예약 건수', data: byGrade, backgroundColor: ACCENT, borderRadius: 6 }],
+    },
+    options: {
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => `${c.parsed.y}건` } } },
+      scales: { y: { beginAtZero: true, ticks: { precision: 0 } }, x: { grid: { display: false } } },
+    },
+  });
+}
+
+// 탭 바꾸기
+function showTab(name) {
+  document.querySelectorAll('nav.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
+  $('tab-booking').hidden = name !== 'booking';
+  $('tab-stats').hidden = name !== 'stats';
+  if (name === 'stats') renderStats();     // 열 때마다 최신 데이터로 다시 그림
 }
 
 // =====================================================================
@@ -517,7 +696,7 @@ async function init() {
     $('setup').hidden = false;
     return;
   }
-  db = window.supabase.createClient(https://mhmgfxzghsntbpntwafh.supabase.co, sb_publishable_qjnZWIXahEkII-MiE66nsw_-SZz75oj);
+  db = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
   // 기본 날짜: 오늘(주말이면 다음 월요일)
   let d = new Date();
@@ -545,6 +724,16 @@ async function init() {
     loadList();
   });
   $('list').addEventListener('click', onCancelClick);
+
+  // 통계 탭
+  if (window.Chart) Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
+  document.querySelectorAll('nav.tabs button').forEach((b) => b.addEventListener('click', () => showTab(b.dataset.tab)));
+  document.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => {
+    statsRange = b.dataset.range;
+    document.querySelectorAll('.seg button').forEach((x) => x.classList.toggle('active', x === b));
+    renderStats();
+  }));
+  $('st-refresh').addEventListener('click', renderStats);
 }
 
 init();
